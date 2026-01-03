@@ -26,7 +26,7 @@ MODULE_VERSION("1.0");
 
 // 设备数据结构
 struct wait_event_demo_device {
-    struct kobject *kobj;
+    struct kobject kobj;
     
     // 等待队列相关
     wait_queue_head_t waitq;
@@ -144,7 +144,7 @@ static ssize_t trigger_wakeup_store(struct kobject *kobj,
 
 // 定义sysfs属性
 static struct kobj_attribute condition_attr = 
-    __ATTR(condition, 0644, condition_show, condition_store);
+    __ATTR(condition, 0664, condition_show, condition_store);
 
 static struct kobj_attribute thread_status_attr = 
     __ATTR(thread_status, 0444, thread_status_show, NULL);
@@ -153,7 +153,7 @@ static struct kobj_attribute stats_attr =
     __ATTR(stats, 0444, stats_show, NULL);
 
 static struct kobj_attribute trigger_wakeup_attr = 
-    __ATTR(trigger_wakeup, 0200, NULL, trigger_wakeup_store);
+    __ATTR(trigger_wakeup, 0220, NULL, trigger_wakeup_store);
 
 static struct attribute *wait_demo_attrs[] = {
     &condition_attr.attr,
@@ -172,7 +172,15 @@ static const struct attribute_group *wait_event_demo_attr_groups[] = {
     NULL
 };
 
-static struct kobj_type wait_demo_ktype = {
+static void wait_event_demo_release(struct kobject *kobj)
+{
+    struct wait_event_demo_device *dev = container_of(kobj, struct wait_event_demo_device, kobj);
+    DRV_LOG_INFO("Releasing wait_event_demo_device device, %px\n", dev);
+    kfree(dev);
+}
+
+static struct kobj_type wait_event_demo_ktype = {
+    .release = wait_event_demo_release,
     .sysfs_ops = &kobj_sysfs_ops,
     .default_groups = wait_event_demo_attr_groups,
 };
@@ -267,15 +275,12 @@ static int __init wait_event_demo_init(void)
      * power_kobj;       // /sys/power/
      * m_kobj;          // /sys/kernel/mm/
      */
-    demo_dev->kobj = kobject_create_and_add("wait_event_demo", kernel_kobj);
-    if (!demo_dev->kobj) {
-        DRV_LOG_ERR("Failed to create wait_event_demo kobject\n");
-        ret = -ENOMEM;
+    ret = kobject_init_and_add(&demo_dev->kobj, &wait_event_demo_ktype,
+                               kernel_kobj, "wait_event_demo");
+    if (ret) {
+        DRV_LOG_ERR("Failed to kobject_init_and_add, ret = %d\n", ret);
         goto err_kobj;
     }
-    
-    // 设置ktype
-    demo_dev->kobj->ktype = &wait_demo_ktype;
     
     // 创建内核线程
     demo_dev->thread = kthread_create(wait_event_demo_thread, demo_dev, 
@@ -310,7 +315,7 @@ static int __init wait_event_demo_init(void)
     return 0;
 
 err_thread:
-    kobject_put(demo_dev->kobj);
+    kobject_put(&demo_dev->kobj);
 err_kobj:
     kfree(demo_dev);
     return ret;
@@ -325,27 +330,8 @@ static void __exit wait_event_demo_exit(void)
         // 停止线程
         if (demo_dev->thread && demo_dev->thread_running) {
             demo_dev->thread_running = false;
-            
-            // 先设置停止标志
             kthread_stop(demo_dev->thread);
-            
-            // 确保线程被唤醒以检查停止标志
-            mutex_lock(&demo_dev->lock);
-            demo_dev->condition = 1;
-            mutex_unlock(&demo_dev->lock);
-            wake_up_interruptible(&demo_dev->waitq);
-            
-            // 等待线程退出
-            if (demo_dev->thread) {
-                int ret = kthread_stop(demo_dev->thread);
-                if (ret == -EINTR)
-                    DRV_LOG_INFO("Thread stopped by signal\n");
-            }
         }
-        
-        // 清理sysfs
-        if (demo_dev->kobj)
-            kobject_put(demo_dev->kobj);
         
         // 清理设备节点
         if (wait_event_device)
@@ -353,8 +339,7 @@ static void __exit wait_event_demo_exit(void)
         if (wait_event_class)
             class_destroy(wait_event_class);
         
-        // 释放内存
-        kfree(demo_dev);
+        kobject_put(&demo_dev->kobj);
         demo_dev = NULL;
     }
     
