@@ -26,141 +26,178 @@ MODULE_VERSION("1.0");
 
 // 设备数据结构
 struct wait_event_demo_device {
-    struct kobject kobj;
-    
-    // 等待队列相关
-    wait_queue_head_t waitq;
-    int condition;              // 等待条件
-    struct mutex lock;          // 保护condition
-    
-    // 线程相关
-    struct task_struct *thread;
-    bool thread_running;
-    
-    // 统计信息
-    unsigned long wakeup_count;
-    unsigned long wait_count;
+	struct kobject kobj;
+
+	// 等待队列相关
+	wait_queue_head_t waitq;
+	int wait_mode;		// 等待mode
+	int condition;		// 等待条件
+	struct mutex lock;	// 保护condition
+
+	// 线程相关
+	struct task_struct *thread;
+
+	// 统计信息
+	unsigned long wakeup_count;
+	unsigned long wait_count;
 };
 
 static struct wait_event_demo_device *demo_dev;
 static struct class *wait_event_class;
 static struct device *wait_event_device;
 
+#define WAIT_MODE_MAX 5
+static char mode_table[WAIT_MODE_MAX][] = {
+	"0: wait_event",
+	"1: wait_event_timeout",
+	"2: wait_event_interruptible",
+	"3: wait_event_interruptible_timeout",
+	"4: wait_event_killable",
+};
+
 // sysfs属性显示函数
-static ssize_t condition_show(struct kobject *kobj, struct kobj_attribute *attr,
-                             char *buf)
+static ssize_t wait_mode_show(struct kobject *kobj, struct kobj_attribute *attr,
+				  char *buf)
 {
-    struct wait_event_demo_device *dev = demo_dev;
-    int cond;
-    
-    mutex_lock(&dev->lock);
-    cond = dev->condition;
-    mutex_unlock(&dev->lock);
-    
-    return sprintf(buf, "%d\n", cond);
+	struct wait_event_demo_device *dev = container_of(kobj, struct wait_event_demo_device, kobj);
+	int wait_mode;
+
+	mutex_lock(&dev->lock);
+	wait_mode = dev->wait_mode;
+	mutex_unlock(&dev->lock);
+
+	if (wait_mode > WAIT_MODE_MAX || wait_mode < 0)
+		return sprintf(buf, "Wrong wait mode: %d\n", wait_mode);
+	else
+		return sprintf(buf, "%s\n", mode_table[wait_mode]);
+}
+
+static ssize_t wait_mode_store(struct kobject *kobj, struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct wait_event_demo_device *dev = container_of(kobj, struct wait_event_demo_device, kobj);
+	int value;
+	int ret;
+
+	ret = kstrtoint(buf, 10, &value);
+	if (ret < 0) {
+		DRV_LOG_ERR("Invalid input: %s\n", buf);
+		return ret;
+	}
+	if (value < 0 || value >= WAIT_MODE_MAX) {
+		DRV_LOG_ERR("Invalid input: %d (range: 0 < value < %d)\n", value, WAIT_MODE_MAX);
+		return -EINVAL;
+	}
+
+	mutex_lock(&dev->lock);
+	wake_up(&dev->waitq);
+	dev->wakeup_count++;
+	DRV_LOG_INFO("Woke up waiting thread(s), total wakeups: %lu\n",
+		     dev->wakeup_count);
+	dev->wait_mode = value;
+	mutex_unlock(&dev->lock);
+
+	return count;
+}
+
+static ssize_t condition_show(struct kobject *kobj, struct kobj_attribute *attr,
+				 char *buf)
+{
+	struct wait_event_demo_device *dev = demo_dev;
+	int cond;
+
+	mutex_lock(&dev->lock);
+	cond = dev->condition;
+	mutex_unlock(&dev->lock);
+
+	return sprintf(buf, "%d\n", cond);
 }
 
 // sysfs属性设置函数
 static ssize_t condition_store(struct kobject *kobj, struct kobj_attribute *attr,
-                              const char *buf, size_t count)
+				  const char *buf, size_t count)
 {
-    struct wait_event_demo_device *dev = demo_dev;
-    int value;
-    int ret;
-    
-    ret = kstrtoint(buf, 10, &value);
-    if (ret < 0) {
-        DRV_LOG_ERR("Invalid input: %s\n", buf);
-        return ret;
-    }
-    
-    mutex_lock(&dev->lock);
-    dev->condition = value;
-    mutex_unlock(&dev->lock);
-    
-    // 如果条件变为1，唤醒所有等待者
-    if (value == 1) {
-        dev->wakeup_count++;
-        wake_up_interruptible(&dev->waitq);
-        DRV_LOG_INFO("Woke up waiting thread(s), total wakeups: %lu\n", 
-                dev->wakeup_count);
-    }
-    
-    return count;
-}
+	struct wait_event_demo_device *dev = demo_dev;
+	int value;
+	int ret;
 
-static ssize_t thread_status_show(struct kobject *kobj, 
-                                 struct kobj_attribute *attr, char *buf)
-{
-    struct wait_event_demo_device *dev = demo_dev;
-    const char *status;
-    
-    if (dev->thread_running) {
-        status = dev->thread ? "running" : "starting";
-    } else {
-        status = "stopped";
-    }
-    
-    return sprintf(buf, "%s\n", status);
+	ret = kstrtoint(buf, 10, &value);
+	if (ret < 0) {
+		DRV_LOG_ERR("Invalid input: %s\n", buf);
+		return ret;
+	}
+
+	mutex_lock(&dev->lock);
+	dev->condition = value;
+	// 如果条件变为1，唤醒所有等待者
+	if (value == 1) {
+		dev->wakeup_count++;
+		wake_up_interruptible(&dev->waitq);
+		DRV_LOG_INFO("Woke up waiting thread(s), total wakeups: %lu\n",
+			     dev->wakeup_count);
+	}
+	mutex_unlock(&dev->lock);
+
+	return count;
 }
 
 static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
-                         char *buf)
+			 char *buf)
 {
-    struct wait_event_demo_device *dev = demo_dev;
-    
-    return sprintf(buf, "Wakeups: %lu\nWaits: %lu\n",
-                   dev->wakeup_count, dev->wait_count);
+	struct wait_event_demo_device *dev = demo_dev;
+
+	return sprintf(buf, "Wakeups: %lu\nWaits: %lu\n",
+		       dev->wakeup_count, dev->wait_count);
 }
 
-static ssize_t trigger_wakeup_store(struct kobject *kobj, 
-                                   struct kobj_attribute *attr,
-                                   const char *buf, size_t count)
+static ssize_t trigger_wakeup_store(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
 {
-    struct wait_event_demo_device *dev = demo_dev;
-    int value;
-    int ret;
-    
-    ret = kstrtoint(buf, 10, &value);
-    if (ret < 0) {
-        DRV_LOG_ERR("Invalid input: %s\n", buf);
-        return ret;
-    }
-    
-    // 任何非零值都会触发唤醒
-    if (value != 0) {
-        mutex_lock(&dev->lock);
-        dev->condition = 1;
-        mutex_unlock(&dev->lock);
-        
-        dev->wakeup_count++;
-        wake_up_interruptible(&dev->waitq);
-        
-        DRV_LOG_INFO("Manual wakeup triggered, total: %lu\n", dev->wakeup_count);
-    }
-    
-    return count;
+	struct wait_event_demo_device *dev = demo_dev;
+	int value;
+	int ret;
+
+	ret = kstrtoint(buf, 10, &value);
+	if (ret < 0) {
+		DRV_LOG_ERR("Invalid input: %s\n", buf);
+		return ret;
+	}
+
+	// 任何非零值都会触发唤醒
+	if (value != 0) {
+		mutex_lock(&dev->lock);
+		dev->condition = 1;
+
+		dev->wakeup_count++;
+		wake_up_interruptible(&dev->waitq);
+
+		DRV_LOG_INFO("Manual wakeup triggered, total: %lu\n", dev->wakeup_count);
+		mutex_unlock(&dev->lock);
+	}
+
+	return count;
 }
 
 // 定义sysfs属性
-static struct kobj_attribute condition_attr = 
-    __ATTR(condition, 0664, condition_show, condition_store);
+static struct kobj_attribute condition_attr =
+	__ATTR(condition, 0664, condition_show, condition_store);
 
-static struct kobj_attribute thread_status_attr = 
-    __ATTR(thread_status, 0444, thread_status_show, NULL);
+static struct kobj_attribute stats_attr =
+	__ATTR(stats, 0444, stats_show, NULL);
 
-static struct kobj_attribute stats_attr = 
-    __ATTR(stats, 0444, stats_show, NULL);
+static struct kobj_attribute trigger_wakeup_attr =
+	__ATTR(trigger_wakeup, 0220, NULL, trigger_wakeup_store);
 
-static struct kobj_attribute trigger_wakeup_attr = 
-    __ATTR(trigger_wakeup, 0220, NULL, trigger_wakeup_store);
+static struct kobj_attribute wait_mode_attr =
+	__ATTR(wait_mode, 0664, wait_mode_show, wait_mode_store);
 
 static struct attribute *wait_demo_attrs[] = {
-    &condition_attr.attr,
-    &thread_status_attr.attr,
-    &stats_attr.attr,
-    &trigger_wakeup_attr.attr,
-    NULL,
+	&wait_mode_attr.attr,
+	&condition_attr.attr,
+	&stats_attr.attr,
+	&trigger_wakeup_attr.attr,
+	NULL,
 };
 
 static const struct attribute_group wait_event_demo_attr_group = {
@@ -169,181 +206,178 @@ static const struct attribute_group wait_event_demo_attr_group = {
 
 static const struct attribute_group *wait_event_demo_attr_groups[] = {
 	&wait_event_demo_attr_group,
-    NULL
+	NULL
 };
 
 static void wait_event_demo_release(struct kobject *kobj)
 {
-    struct wait_event_demo_device *dev = container_of(kobj, struct wait_event_demo_device, kobj);
-    DRV_LOG_INFO("Releasing wait_event_demo_device device, %px\n", dev);
-    kfree(dev);
+	struct wait_event_demo_device *dev = container_of(kobj, struct wait_event_demo_device, kobj);
+	DRV_LOG_INFO("Releasing wait_event_demo_device device, %px\n", dev);
+	kfree(dev);
 }
 
 static struct kobj_type wait_event_demo_ktype = {
-    .release = wait_event_demo_release,
-    .sysfs_ops = &kobj_sysfs_ops,
-    .default_groups = wait_event_demo_attr_groups,
+	.release = wait_event_demo_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = wait_event_demo_attr_groups,
 };
 
 // 内核线程函数
 static int wait_event_demo_thread(void *data)
 {
-    struct wait_event_demo_device *dev = data;
-    int ret = 0;
-    int wait_cycle = 0;
-    
-    // 允许SIGKILL信号
-    allow_signal(SIGKILL);
-    
-    DRV_LOG_INFO("Wait event demo thread started, PID: %d\n", current->pid);
-    
-    while (!kthread_should_stop()) {
-        wait_cycle++;
-        
-        // 重置条件
-        mutex_lock(&dev->lock);
-        dev->condition = 0;
-        mutex_unlock(&dev->lock);
-        
-        DRV_LOG_INFO("Thread: Waiting for condition (cycle %d)...\n", wait_cycle);
-        dev->wait_count++;
-        
-        // 使用wait_event_interruptible等待
-        ret = wait_event_interruptible(dev->waitq, 
-                                       (dev->condition != 0) || 
-                                       kthread_should_stop());
-        
-        // 检查中断原因
-        if (ret == -ERESTARTSYS) {
-            /*
-             * 检查是否为致命信号
-             * 如果是致命信号，应该退出线程
-             * 否则可以继续等待
-             */
-            if (fatal_signal_pending(current)) {
-                DRV_LOG_INFO("Thread: Received fatal signal, exiting\n");
-                break;
-            }
-            
-            DRV_LOG_INFO("Thread: Interrupted by non-fatal signal, continuing...\n");
-            continue;
-        }
-        
-        if (kthread_should_stop()) {
-            DRV_LOG_INFO("Thread: Received stop request\n");
-            break;
-        }
-        
-        // 正常唤醒
-        DRV_LOG_INFO("Thread: Woken up! Condition = %d\n", dev->condition);
-        
-        // 模拟一些处理工作
-        msleep_interruptible(100);
-    }
-    
-    DRV_LOG_INFO("Wait demo thread exiting\n");
-    return 0;
+	struct wait_event_demo_device *dev = data;
+	int ret = 0;
+	int wait_cycle = 0;
+
+	// 允许SIGKILL信号
+	allow_signal(SIGKILL);
+
+	DRV_LOG_INFO("Wait event demo thread started, PID: %d\n", current->pid);
+
+	while (!kthread_should_stop()) {
+		wait_cycle++;
+
+		// 重置条件
+		mutex_lock(&dev->lock);
+		dev->condition = 0;
+		dev->wait_count++;
+		mutex_unlock(&dev->lock);
+		DRV_LOG_INFO("Thread: Waiting for condition (cycle %d)...\n", wait_cycle);
+
+		// 使用wait_event_interruptible等待
+		ret = wait_event_interruptible(dev->waitq,
+					       (dev->condition != 0) || kthread_should_stop());
+
+		// 检查中断原因
+		if (ret == -ERESTARTSYS) {
+			/**
+			 * 检查是否为致命信号
+			 * 如果是致命信号，应该退出线程
+			 * 否则可以继续等待
+			 */
+			if (fatal_signal_pending(current)) {
+				DRV_LOG_INFO("Thread: Received fatal signal, exiting\n");
+				break;
+			}
+
+			DRV_LOG_INFO("Thread: Interrupted by non-fatal signal, continuing...\n");
+			continue;
+		}
+
+		if (kthread_should_stop()) {
+			DRV_LOG_INFO("Thread: Received stop request\n");
+			break;
+		}
+
+		// 正常唤醒
+		DRV_LOG_INFO("Thread: Woken up! Condition = %d\n", dev->condition);
+
+		// 模拟一些处理工作
+		msleep_interruptible(100);
+	}
+
+	DRV_LOG_INFO("Wait demo thread exiting\n");
+	return 0;
 }
 
 // 创建设备
 static int __init wait_event_demo_init(void)
 {
-    int ret = 0;
-    
-    DRV_LOG_INFO("Wait Event Demo Driver Initializing...\n");
-    
-    // 分配设备结构
-    demo_dev = kzalloc(sizeof(*demo_dev), GFP_KERNEL);
-    if (!demo_dev) {
-        DRV_LOG_ERR("Failed to allocate device structure\n");
-        return -ENOMEM;
-    }
-    
-    // 初始化等待队列
-    init_waitqueue_head(&demo_dev->waitq);
-    mutex_init(&demo_dev->lock);
-    demo_dev->condition = 0;
-    demo_dev->thread_running = false;
-    demo_dev->wakeup_count = 0;
-    demo_dev->wait_count = 0;
-    
-    // 到/sys/kernel/目录下创建sysfs kobject，名为“wait_event_demo“
-    /* 常用的全局 kobject 指针
-     * kernel_kobj;      // /sys/kernel/
-     * fs_kobj;          // /sys/fs/
-     * dev_kobj;         // /sys/dev/
-     * power_kobj;       // /sys/power/
-     * m_kobj;          // /sys/kernel/mm/
-     */
-    ret = kobject_init_and_add(&demo_dev->kobj, &wait_event_demo_ktype,
-                               kernel_kobj, "wait_event_demo");
-    if (ret) {
-        DRV_LOG_ERR("Failed to kobject_init_and_add, ret = %d\n", ret);
-        goto err_kobj;
-    }
-    
-    // 创建内核线程
-    demo_dev->thread = kthread_create(wait_event_demo_thread, demo_dev, 
-                                     "wait_event_demo_thread");
-    if (IS_ERR(demo_dev->thread)) {
-        ret = PTR_ERR(demo_dev->thread);
-        DRV_LOG_ERR("Failed to create kernel thread: %d\n", ret);
-        goto err_thread;
-    }
-    
-    demo_dev->thread_running = true;
-    wake_up_process(demo_dev->thread);
-    
-    // 创建设备类和设备（可选，用于完整性）
-    wait_event_class = class_create(CLASS_NAME);
-    if (IS_ERR(wait_event_class)) {
-        DRV_LOG_WARN("Failed to create class, continuing without device node\n");
-        wait_event_class = NULL;
-    } else {
-        wait_event_device = device_create(wait_event_class, NULL, 
-                                   MKDEV(0, 0), NULL, DEVICE_NAME);
-        if (IS_ERR(wait_event_device)) {
-            DRV_LOG_WARN("Failed to create device\n");
-            wait_event_device = NULL;
-        }
-    }
-    
-    DRV_LOG_INFO("Wait Event Demo Driver Loaded Successfully\n");
-    DRV_LOG_INFO("Sysfs interface at: /sys/kernel/wait_event_demo/\n");
-    DRV_LOG_INFO("Use 'echo 1 > /sys/kernel/wait_event_demo/trigger_wakeup' to wake thread\n");
-    
-    return 0;
+	int ret = 0;
+
+	DRV_LOG_INFO("Wait Event Demo Driver Initializing...\n");
+
+	// 分配设备结构
+	demo_dev = kzalloc(sizeof(*demo_dev), GFP_KERNEL);
+	if (!demo_dev) {
+		DRV_LOG_ERR("Failed to allocate device structure\n");
+		return -ENOMEM;
+	}
+
+	// 初始化等待队列
+	init_waitqueue_head(&demo_dev->waitq);
+	mutex_init(&demo_dev->lock);
+	demo_dev->condition = 0;
+	demo_dev->wakeup_count = 0;
+	demo_dev->wait_count = 0;
+
+	// 到/sys/kernel/目录下创建sysfs kobject，名为“wait_event_demo“
+	/* 常用的全局 kobject 指针
+	 * kernel_kobj;		// /sys/kernel/
+	 * fs_kobj;		// /sys/fs/
+	 * dev_kobj;		// /sys/dev/
+	 * power_kobj;		// /sys/power/
+	 * m_kobj;		// /sys/kernel/mm/
+	 */
+	ret = kobject_init_and_add(&demo_dev->kobj, &wait_event_demo_ktype,
+				   kernel_kobj, "wait_event_demo");
+	if (ret) {
+		DRV_LOG_ERR("Failed to kobject_init_and_add, ret = %d\n", ret);
+		goto err_kobj;
+	}
+
+	// 创建内核线程
+	demo_dev->thread = kthread_create(wait_event_demo_thread, demo_dev,
+					  "wait_event_demo_thread");
+	if (IS_ERR(demo_dev->thread)) {
+		ret = PTR_ERR(demo_dev->thread);
+		DRV_LOG_ERR("Failed to create kernel thread: %d\n", ret);
+		goto err_thread;
+	}
+
+	wake_up_process(demo_dev->thread);
+
+	// 创建设备类和设备（可选，用于完整性）
+	/* 在/sys/class/下会生成wait_event_cls */
+	wait_event_class = class_create(CLASS_NAME);
+	if (IS_ERR(wait_event_class)) {
+		DRV_LOG_WARN("Failed to create class, continuing without device node\n");
+		wait_event_class = NULL;
+	} else {
+		/* 创建/sys/class/wait_event_cls/wait_event_demo_dev 和 /dev/wait_event_demo_dev */
+		wait_event_device = device_create(wait_event_class, NULL,
+					MKDEV(0, 0), NULL, DEVICE_NAME);
+		if (IS_ERR(wait_event_device)) {
+			DRV_LOG_WARN("Failed to create device\n");
+			wait_event_device = NULL;
+		}
+	}
+
+	DRV_LOG_INFO("Wait Event Demo Driver Loaded Successfully\n");
+	DRV_LOG_INFO("Sysfs interface at: /sys/kernel/wait_event_demo/\n");
+	DRV_LOG_INFO("Use 'echo 1 > /sys/kernel/wait_event_demo/trigger_wakeup' to wake thread\n");
+
+	return 0;
 
 err_thread:
-    kobject_put(&demo_dev->kobj);
+	kobject_put(&demo_dev->kobj);
 err_kobj:
-    kfree(demo_dev);
-    return ret;
+	kfree(demo_dev);
+	return ret;
 }
 
 // 清理函数
 static void __exit wait_event_demo_exit(void)
 {
-    DRV_LOG_INFO("Wait Event Demo Driver Exiting...\n");
-    
-    if (demo_dev) {
-        // 停止线程
-        if (demo_dev->thread && demo_dev->thread_running) {
-            demo_dev->thread_running = false;
-            kthread_stop(demo_dev->thread);
-        }
-        
-        // 清理设备节点
-        if (wait_event_device)
-            device_destroy(wait_event_class, MKDEV(0, 0));
-        if (wait_event_class)
-            class_destroy(wait_event_class);
-        
-        kobject_put(&demo_dev->kobj);
-        demo_dev = NULL;
-    }
-    
-    DRV_LOG_INFO("Wait Event Demo Driver Unloaded\n");
+	DRV_LOG_INFO("Wait Event Demo Driver Exiting...\n");
+
+	if (demo_dev) {
+		// 停止线程
+		if (demo_dev->thread) {
+			kthread_stop(demo_dev->thread);
+		}
+
+		// 清理设备节点
+		if (wait_event_device)
+			device_destroy(wait_event_class, MKDEV(0, 0));
+		if (wait_event_class)
+			class_destroy(wait_event_class);
+
+		kobject_put(&demo_dev->kobj);
+		demo_dev = NULL;
+	}
+
+	DRV_LOG_INFO("Wait Event Demo Driver Unloaded\n");
 }
 
 module_init(wait_event_demo_init);
