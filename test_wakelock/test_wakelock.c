@@ -14,6 +14,7 @@
 
 static struct wakeup_source *demo_ws;
 static struct kobject *demo_kobj;
+static struct platform_device *demo_pdev;
 static int timeout_sec = PM_STAY_AWAKE_TIME_SEC;
 
 /* 测试 1: 使用 __pm_stay_awake (手动控制) */
@@ -21,6 +22,7 @@ static void test_manual_wakelock(void)
 {
 	pr_info("demo: Holding wakelock manually.\n");
 	__pm_stay_awake(demo_ws);
+	pr_info("demo: WS name: %s, active: %d\n", demo_ws->name, demo_ws->active);
 }
 
 /* 释放接口: 使用 __pm_relax (手动控制) */
@@ -28,6 +30,7 @@ static void test_relax_wakelock(void)
 {
 	pr_info("demo: Releasing wakelock manually.\n");
 	__pm_relax(demo_ws);
+	pr_info("demo: WS name: %s, active: %d\n", demo_ws->name, demo_ws->active);
 }
 
 /* 测试 2: 使用 __pm_wakeup_event (自动超时释放) */
@@ -36,6 +39,7 @@ static void test_event_wakelock(void)
 	pr_info("demo: Triggering %d ms event wakelock...\n", timeout_sec * 1000);
 	/* 保持指定的毫秒数后自动释放 */
 	__pm_wakeup_event(demo_ws, timeout_sec * 1000);
+	pr_info("demo: WS name: %s, active: %d\n", demo_ws->name, demo_ws->active);
 }
 
 static ssize_t trigger_store(struct kobject *kobj, struct kobj_attribute *attr,
@@ -82,24 +86,32 @@ static struct attribute_group demo_attr_group = {
 static int __init demo_init(void)
 {
 	int ret;
-	demo_ws = wakeup_source_register(NULL, WS_NAME);
-	if (!demo_ws)
-		return -ENOMEM;
+
+	demo_pdev = platform_device_register_simple("demo_wakelock_dev", -1, NULL, 0);
+	if (IS_ERR(demo_pdev))
+		return PTR_ERR(demo_pdev);
+
+	/* 启用设备唤醒能力，这会初始化 dev->power.wakeup */
+	device_init_wakeup(&demo_pdev->dev, true);
+	demo_ws = demo_pdev->dev.power.wakeup;
 
 	demo_kobj = kobject_create_and_add("demo_wakelock", kernel_kobj);
 	if (!demo_kobj) {
-		wakeup_source_unregister(demo_ws);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto unreg_pdev;
 	}
 
 	ret = sysfs_create_group(demo_kobj, &demo_attr_group);
-	if (ret) {
-		kobject_put(demo_kobj);
-		wakeup_source_unregister(demo_ws);
-		return ret;
-	}
+	if (ret)
+		goto put_kobj;
 
 	return 0;
+
+put_kobj:
+	kobject_put(demo_kobj);
+unreg_pdev:
+	platform_device_unregister(demo_pdev);
+	return ret;
 }
 
 static void __exit demo_exit(void)
@@ -108,8 +120,10 @@ static void __exit demo_exit(void)
 		sysfs_remove_group(demo_kobj, &demo_attr_group);
 		kobject_put(demo_kobj);
 	}
-	if (demo_ws)
-		wakeup_source_unregister(demo_ws);
+	if (demo_pdev) {
+		device_init_wakeup(&demo_pdev->dev, false);
+		platform_device_unregister(demo_pdev);
+	}
 }
 
 module_init(demo_init);
